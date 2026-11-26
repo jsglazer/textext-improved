@@ -22,8 +22,9 @@ from io import open # ToDo: For open utf8, remove when Python 2 support is skipp
 
 from .requirements_check import defaults, set_logging_levels, TexTextRequirementsChecker
 from .utility import ChangeToTemporaryDirectory, CycleBufferHandler, MyLogger, NestedLoggingGuard, Settings, Cache, \
-    exec_command, version_greater_or_equal_than
+    exec_command, version_greater_or_equal_than, TemporaryDirectory
 from .errors import *
+from . import mathmode
 
 with open(os.path.join(os.path.dirname(__file__), "VERSION")) as version_file:
     __version__ = version_file.readline().strip()
@@ -198,7 +199,9 @@ class TexText(inkex.EffectExtension):
             node.__class__ = TexTextElement
             text, preamble_file, scale = node.get_all_info()
             alignment = node.get_meta_alignment()
-            new_node = self._do_convert_one(text, preamble_file, scale, alignment, self.options.tex_command)
+            node_math_mode = node.get_meta("mathmode", "off")
+            new_node = self._do_convert_one(text, preamble_file, scale, alignment, self.options.tex_command,
+                                            math_mode=node_math_mode)
             self._replace_node(node, new_node, scale, alignment, scale)
 
     def effect(self):
@@ -251,6 +254,13 @@ class TexText(inkex.EffectExtension):
 
             gui_config = self.config.get("gui", {})
 
+            # textext-improved: automatic math mode. Existing nodes keep the mode they were made with
+            # (nodes from stock TexText have none, i.e. "off"); new nodes use the last mode chosen.
+            if old_svg_ele is not None:
+                current_math_mode = mathmode.normalize_mode(old_svg_ele.get_meta("mathmode", "off"))
+            else:
+                current_math_mode = mathmode.normalize_mode(gui_config.get("math_mode", mathmode.DEFAULT_MATH_MODE))
+
             # Ask for TeX code
             if self.options.text is None:
                 global_scale_factor = self.options.scale_factor
@@ -297,7 +307,7 @@ class TexText(inkex.EffectExtension):
                 elif toolkit is None:
                     try:
                         AskTextImpl = load_asktext_gtk()
-                    except (ImportError, TypeError, ValueError):
+                    except (ImportError, TypeError, ValueError, AttributeError):
                         try:
                             AskTextImpl = load_asktext_tk()
                         except ImportError:
@@ -312,6 +322,7 @@ class TexText(inkex.EffectExtension):
                                     tex_commands=sorted(list(
                                       self.requirements_checker.available_tex_to_pdf_converters.keys())),
                                     gui_config=gui_config)
+                asker.current_math_mode = current_math_mode
 
                 if error_thrown_by_get_old:
                     asker.show_error_dialog("TexText Error", "Error with user selection",
@@ -319,18 +330,20 @@ class TexText(inkex.EffectExtension):
                     raise error_thrown_by_get_old
 
                 def save_callback(_text, _preamble, _scale, alignment=TexText.DEFAULT_ALIGNMENT,
-                                  tex_cmd=TexText.DEFAULT_TEXCMD):
+                                  tex_cmd=TexText.DEFAULT_TEXCMD, math_mode=None):
                     return self.do_convert(_text, _preamble, _scale, old_svg_ele,
                                            alignment,
                                            tex_command=tex_cmd,
-                                           original_scale=current_scale)
+                                           original_scale=current_scale,
+                                           math_mode=current_math_mode if math_mode is None else math_mode)
 
-                def preview_callback(_text, _preamble, _preview_callback, _tex_command, _white_bg):
+                def preview_callback(_text, _preamble, _preview_callback, _tex_command, _white_bg, math_mode=None):
                     return self.preview_convert(_text,
                                                 _preamble,
                                                 _preview_callback,
                                                 _tex_command,
-                                                _white_bg
+                                                _white_bg,
+                                                math_mode=current_math_mode if math_mode is None else math_mode
                                                 )
 
                 with logger.debug("Run TexText GUI"):
@@ -355,7 +368,9 @@ class TexText(inkex.EffectExtension):
                                 old_svg_ele,
                                 self.options.alignment,
                                 self.options.tex_command,
-                                original_scale=current_scale
+                                original_scale=current_scale,
+                                math_mode=(old_svg_ele.get_meta("mathmode", "off")
+                                           if old_svg_ele is not None else "off")
                                 )
 
     @staticmethod
@@ -366,7 +381,7 @@ class TexText(inkex.EffectExtension):
                 namespaces={'svg': SVG_NS, 'textext': TEXTEXT_NS})
 
 
-    def preview_convert(self, text, preamble_file, image_setter, tex_command, white_bg):
+    def preview_convert(self, text, preamble_file, image_setter, tex_command, white_bg, math_mode="off"):
         """
         Generates a preview PNG of the LaTeX output using the selected converter.
 
@@ -391,9 +406,14 @@ class TexText(inkex.EffectExtension):
             if isinstance(text, bytes):
                 text = text.decode('utf-8')
 
-            with ChangeToTemporaryDirectory():
+            text = mathmode.wrap(text, math_mode, tex_command)
+
+            # textext-improved: no os.chdir here. The live preview runs this in a worker thread
+            # while the GUI keeps running, and the working directory is shared by the whole process.
+            # The converter works in its own absolute temporary directory instead.
+            with TemporaryDirectory() as work_dir:
                 with logger.debug("Converting tex to pdf"):
-                    converter = TexToPdfConverter(self.requirements_checker)
+                    converter = TexToPdfConverter(self.requirements_checker, work_dir=work_dir)
                     if tex_command == "typst":
                         converter.typ_to_any(tex_executable, text, preamble_file, 'pdf')
                     else:
@@ -401,20 +421,23 @@ class TexText(inkex.EffectExtension):
                     converter.pdf_to_png(white_bg=white_bg)
                     image_setter(converter.tmp('png'))
 
-    def _do_convert_one(self, text: str, preamble_file, user_scale_factor, alignment, tex_command):
+    def _do_convert_one(self, text: str, preamble_file, user_scale_factor, alignment, tex_command,
+                        math_mode="off"):
         """
         Does the conversion using the selected converter.
         See documentation in do_convert for more details.
         """
         tex_executable = self.requirements_checker.available_tex_to_pdf_converters[tex_command]
+        math_mode = mathmode.normalize_mode(math_mode)
+        compile_text = mathmode.wrap(text, math_mode, tex_command)
 
         with logger.debug("Converting tex to svg"):
             with ChangeToTemporaryDirectory():
                 converter = TexToPdfConverter(self.requirements_checker)
                 if tex_command == "typst":
-                    converter.typ_to_any(tex_executable, text, preamble_file, 'svg')
+                    converter.typ_to_any(tex_executable, compile_text, preamble_file, 'svg')
                 else:
-                    converter.tex_to_pdf(tex_executable, text, preamble_file)
+                    converter.tex_to_pdf(tex_executable, compile_text, preamble_file)
                     converter.pdf_to_svg()
 
                 tt_node = TexTextElement(converter.tmp("svg"), self.svg.unit)
@@ -427,6 +450,7 @@ class TexText(inkex.EffectExtension):
         tt_node.set_meta("preamble", preamble_file)
         tt_node.set_meta("scale", str(user_scale_factor))
         tt_node.set_meta("alignment", str(alignment))
+        tt_node.set_meta("mathmode", math_mode)
         try:
             inkscape_version = self.document.getroot().get('inkscape:version')
             tt_node.set_meta("inkscapeversion", inkscape_version.split(' ')[0])
@@ -496,7 +520,7 @@ class TexText(inkex.EffectExtension):
             self.replace_node(old_svg_ele, tt_node)
 
     def do_convert(self, text, preamble_file, user_scale_factor, old_svg_ele, alignment, tex_command,
-                   original_scale=None):
+                   original_scale=None, math_mode="off"):
         """
         Does the conversion using the selected converter.
 
@@ -520,7 +544,8 @@ class TexText(inkex.EffectExtension):
             if isinstance(text, bytes):
                 text = text.decode('utf-8')
 
-            tt_node = self._do_convert_one(text, preamble_file, user_scale_factor, alignment, tex_command)
+            tt_node = self._do_convert_one(text, preamble_file, user_scale_factor, alignment, tex_command,
+                                           math_mode=math_mode)
 
             # Place new node in document
             if old_svg_ele is None:
@@ -603,8 +628,11 @@ class TexToPdfConverter:
     LATEX_OPTIONS = ['-interaction=nonstopmode',
                      '-halt-on-error']
 
-    def __init__(self, checker):
-        self.tmp_base = 'tmp'
+    def __init__(self, checker, work_dir=None):
+        # work_dir: absolute directory for the temporary files. None keeps the original behaviour
+        # (files in the current directory, which the caller has changed to a temporary one).
+        self.work_dir = work_dir
+        self.tmp_base = os.path.join(work_dir, 'tmp') if work_dir else 'tmp'
         self.checker = checker  # type: requirements_check.TexTextRequirementsChecker
         
         # If a file with the name "LATEX_OPTIONS" exists in the textext plugin directory, we interpret each line 
@@ -662,7 +690,7 @@ class TexToPdfConverter:
                 # appearing before the input file. Therefore, there options are added in between the command 
                 # and the input file path here.
                 command = [tex_command, *self.LATEX_OPTIONS, self.tmp('tex')]
-                exec_command(command)
+                exec_command(command, cwd=self.work_dir)
                 
             except TexTextCommandFailed as error:
                 

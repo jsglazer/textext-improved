@@ -238,12 +238,13 @@ class SuppressStream(object):
         self.devnull.close()
 
 
-def exec_command(cmd, ok_return_value=0):
+def exec_command(cmd, ok_return_value=0, cwd=None):
     """
     Run given command, check return value, and return
     concatenated stdout and stderr.
     :param cmd: Command to execute
     :param ok_return_value: The expected return value after successful completion
+    :param cwd: Working directory for the command (None = current directory)
     :raises: TexTextCommandNotFound, TexTextCommandFailed
     """
 
@@ -259,7 +260,8 @@ def exec_command(cmd, ok_return_value=0):
                              stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE,
                              stdin=subprocess.PIPE,
-                             startupinfo=info)
+                             startupinfo=info,
+                             cwd=cwd)
         out, err = p.communicate()
     except OSError as err:
         raise TexTextCommandNotFound("Command %s failed: %s" % (' '.join(cmd), err))

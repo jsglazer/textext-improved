@@ -9,3 +9,14 @@ textext/.cache.json
 textext/config.json
 docs/build/**
 .DS_Store
+
+# textext-improved (local-only files)
+NewBuild/
+CLAUDE.md
+GEMINI.md
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/

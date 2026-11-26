@@ -31,10 +31,14 @@ WINDOW_TITLE = "Enter LaTeX Formula - TexText"
 
 import os
 import sys
+import threading
 import warnings
 import traceback
 from .errors import TexTextCommandFailed
 from textext.utility import SuppressStream
+from . import mathmode
+from . import latex_completion
+from . import macos_front
 
 
 class AskText(object):
@@ -43,7 +47,7 @@ class AskText(object):
     ALIGNMENT_LABELS = ["top left", "top center", "top right",
                         "middle left", "middle center", "middle right",
                         "bottom left", "bottom center", "bottom right"]
-    DEFAULT_WORDWRAP = False
+    DEFAULT_WORDWRAP = True
     DEFAULT_SHOWLINENUMBERS = True
     DEFAULT_AUTOINDENT = True
     DEFAULT_INSERTSPACES = True
@@ -53,6 +57,9 @@ class AskText(object):
     DEFAULT_CLOSE_SHORTCUT = "Escape"
     DEFAULT_CONFIRM_CLOSE = True
     DEFAULT_PREVIEW_WHITE_BACKGROUND = False
+    DEFAULT_LIVE_PREVIEW = True
+    DEFAULT_AUTOCOMPLETE = True
+    LIVE_PREVIEW_DELAY_MS = 600
     FONT_SIZE = [11, 12, 14, 16]
     NEW_NODE_CONTENT = ["Empty", "InlineMath", "DisplayMath"]
     CLOSE_SHORTCUT = ["Escape", "CtrlQ", "None"]
@@ -101,6 +108,8 @@ class AskText(object):
         self._ok_button = None
         self._cancel_button = None
         self._window = None
+        # textext-improved: math mode of the node being edited; base.py sets it after construction
+        self.current_math_mode = mathmode.DEFAULT_MATH_MODE
 
     def ask(self, callback, preview_callback=None):
         """
@@ -343,6 +352,18 @@ def load_asktext_tk():
             # Update status
             self.on_texcmd_change()
 
+            # textext-improved: bring the dialog to the front (macOS opens it behind Inkscape)
+            def bring_to_front():
+                try:
+                    macos_front.activate_current_process()
+                    self._root.lift()
+                    self._root.attributes('-topmost', True)
+                    self._root.after(400, lambda: self._root.attributes('-topmost', False))
+                    self._root.focus_force()
+                except Exception:
+                    pass
+            self._root.after(50, bring_to_front)
+
             self._root.mainloop()
             return self._gui_config
 
@@ -487,7 +508,7 @@ def load_asktext_gtk(use_gtk_source=None):
         sys.stderr.write(msg)
     # ======
 
-    from gi.repository import Gdk, GdkPixbuf
+    from gi.repository import Gdk, GdkPixbuf, GLib, GObject
 
     # If successful, try GTKSourceView (bonus points!)
     # unfortunately, with Inkscape being 32bit on OSX, I couldn't get GTKSourceView to work, yet
@@ -499,6 +520,102 @@ def load_asktext_gtk(use_gtk_source=None):
         except (ImportError, TypeError, ValueError) as _:
             if use_gtk_source:
                 raise
+
+    LatexCompletionProvider = None
+    if GtkSource is not None:
+        class LatexCompletionProvider(GObject.Object, GtkSource.CompletionProvider):
+            """textext-improved: completes LaTeX commands after a backslash and environment names
+            inside \\begin{...}/\\end{...}. Matching logic lives in latex_completion.py."""
+
+            MAX_PROPOSALS = 60
+
+            def __init__(self, asktext):
+                GObject.Object.__init__(self)
+                self._asktext = asktext
+                self._templates = {}
+
+            def do_get_name(self):
+                return "LaTeX"
+
+            def do_get_priority(self):
+                return 10
+
+            def do_get_activation(self):
+                return GtkSource.CompletionActivation.INTERACTIVE | GtkSource.CompletionActivation.USER_REQUESTED
+
+            @staticmethod
+            def _context_iter(context):
+                result = context.get_iter()
+                # GtkSource 4 returns (valid, iter); older bindings return the iter alone
+                if isinstance(result, tuple):
+                    return result[1] if result[0] else None
+                return result
+
+            @staticmethod
+            def _prefix_at(text_iter):
+                line_start = text_iter.copy()
+                line_start.set_line_offset(0)
+                return latex_completion.find_prefix(line_start.get_text(text_iter))
+
+            def do_match(self, context):
+                text_iter = self._context_iter(context)
+                return text_iter is not None and self._prefix_at(text_iter) is not None
+
+            def do_populate(self, context):
+                proposals = []
+                text_iter = self._context_iter(context)
+                found = self._prefix_at(text_iter) if text_iter is not None else None
+                self._templates = {}
+                if found is not None:
+                    kind, prefix, _ = found
+                    user_requested = context.get_activation() & GtkSource.CompletionActivation.USER_REQUESTED
+                    if kind == "command" and (len(prefix) >= 2 or user_requested):
+                        extra = latex_completion.user_commands(self._asktext.preamble_text(),
+                                                               self._asktext.buffer_text())
+                        templates = latex_completion.match_commands(prefix, extra)
+                    elif kind == "env":
+                        templates = latex_completion.match_environments(prefix)
+                    else:
+                        templates = []
+                    for template in templates[:self.MAX_PROPOSALS]:
+                        self._templates[template] = kind
+                        proposals.append(GtkSource.CompletionItem(label=template, text=template))
+                context.add_proposals(self, proposals, True)
+
+            def do_activate_proposal(self, proposal, text_iter):
+                template = proposal.get_label()
+                kind = self._templates.get(template)
+                found = self._prefix_at(text_iter)
+                if kind is None or found is None:
+                    return False
+                _, _, start_offset = found
+                text_buffer = text_iter.get_buffer()
+                start = text_iter.copy()
+                start.set_line_offset(start_offset)
+                end = text_iter.copy()
+
+                if kind == "env":
+                    line_start = text_iter.copy()
+                    line_start.set_line_offset(0)
+                    line_text = line_start.get_text(text_iter)
+                    is_begin = line_text.rfind("\\begin") > line_text.rfind("\\end")
+                    indent = line_text[:len(line_text) - len(line_text.lstrip())]
+                    insert, cursor = latex_completion.expand_environment(template, is_begin, indent)
+                    if end.get_char() == "}":  # an auto-closed brace is replaced, not doubled
+                        end.forward_char()
+                else:
+                    insert, cursor = latex_completion.expand_command(template)
+
+                text_buffer.begin_user_action()
+                text_buffer.delete(start, end)
+                mark = text_buffer.create_mark(None, start, True)
+                text_buffer.insert(start, insert)
+                cursor_iter = text_buffer.get_iter_at_mark(mark)
+                cursor_iter.forward_chars(cursor)
+                text_buffer.place_cursor(cursor_iter)
+                text_buffer.delete_mark(mark)
+                text_buffer.end_user_action()
+                return True
 
     def set_monospace_font(text_view, font_size):
         """
@@ -530,6 +647,16 @@ def load_asktext_gtk(use_gtk_source=None):
             self._preview_callback = None
             self._source_view = None
             self._preamble_delete_btn = None
+            # textext-improved: live preview / completion state
+            self._live_timer = None
+            self._live_thread = None
+            self._live_pending = False
+            self._live_pending_dialog = False
+            self._live_generation = 0
+            self._preview_error_label = None
+            self._math_mode_cbox = None
+            self._completion_visible = False
+            self._completion_provider = None
 
             self.buffer_actions = [
                 ('Open', Gtk.STOCK_OPEN, '_Open', '<control>O', 'Open a file', self.open_file_cb)
@@ -583,6 +710,16 @@ def load_asktext_gtk(use_gtk_source=None):
                  'Set preview background to white', self.on_preview_background_chagned)
             ]
 
+            self._live_preview_action = [
+                ('LivePreview', None, '_Live Preview', None,
+                 'Update the preview automatically while typing', self.live_preview_toggled_cb)
+            ]
+
+            self._autocomplete_action = [
+                ('AutoComplete', None, 'Auto-_complete LaTeX', None,
+                 'Suggest LaTeX commands after a backslash and environments in \\begin{}', self.autocomplete_toggled_cb)
+            ]
+
             self._confirm_close_action = [
                 ('ConfirmClose', None, '_Confirm Closing of Window', None,
                  'Request confirmation for closing the window when text has been changed', self.confirm_close_toggled_cb)
@@ -631,6 +768,8 @@ def load_asktext_gtk(use_gtk_source=None):
                   <menuitem action='WordWrap'/>
                   {additions}
                   <menuitem action='WhitePreviewBackground'/>
+                  <menuitem action='LivePreview'/>
+                  {autocomplete}
                 </menu>
                 <menu action='SettingsMenu'>
                   <menu action='NewNodeContent'>
@@ -644,7 +783,8 @@ def load_asktext_gtk(use_gtk_source=None):
               </menubar>
             </ui>
             """.format(additions=gtksourceview_ui_additions, font_size=font_size,
-                       new_node_content=new_node_content, close_shortcut=close_shortcut)
+                       new_node_content=new_node_content, close_shortcut=close_shortcut,
+                       autocomplete="" if GtkSource is None else "<menuitem action='AutoComplete'/>")
 
         @staticmethod
         def open_file_cb(_, text_buffer):
@@ -745,6 +885,22 @@ def load_asktext_gtk(use_gtk_source=None):
 
         def on_preview_background_chagned(self, action, sourceview):
             self._gui_config["white_preview_background"] = action.get_active()
+            self.schedule_live_preview()
+
+        def live_preview_toggled_cb(self, action, sourceview):
+            self._gui_config["live_preview"] = action.get_active()
+            if action.get_active():
+                self.schedule_live_preview(delay_ms=0)
+
+        def autocomplete_toggled_cb(self, action, sourceview):
+            self._gui_config["autocomplete"] = action.get_active()
+            if self._completion_provider is None:
+                return
+            completion = sourceview.get_completion()
+            if action.get_active():
+                completion.unblock_interactive()
+            else:
+                completion.block_interactive()
 
         def tabs_toggled_cb(self, action, previous_value, sourceview):
             sourceview.set_tab_width(action.get_current_value())
@@ -776,6 +932,9 @@ def load_asktext_gtk(use_gtk_source=None):
             """
 
             ctrl_is_pressed = Gdk.ModifierType.CONTROL_MASK & event.state
+            # textext-improved: while the completion popup is open, Escape/Return belong to it
+            if self._completion_visible and Gdk.keyval_name(event.keyval) in ('Escape', 'Return', 'Tab'):
+                return False
             if Gdk.keyval_name(event.keyval) == 'Return' and ctrl_is_pressed:
                 self._ok_button.clicked()
                 return True
@@ -812,13 +971,15 @@ def load_asktext_gtk(use_gtk_source=None):
             try:
                 self.callback(self.text, self.preamble_file, self.global_scale_factor,
                               self.ALIGNMENT_LABELS[self._alignment_combobox.get_active()],
-                              self.TEX_COMMANDS[self._texcmd_cbox.get_active()].lower())
+                              self.TEX_COMMANDS[self._texcmd_cbox.get_active()].lower(),
+                              math_mode=self.current_math_mode)
             except Exception as error:
                 self.show_error_dialog("TexText Error",
                                        "Error occurred while converting text from Latex to SVG:",
                                        error)
                 return False
 
+            self.cancel_live_preview()
             Gtk.main_quit()
             return False
 
@@ -829,6 +990,12 @@ def load_asktext_gtk(use_gtk_source=None):
         def cb_compiler_changed(self, combo_box):
             self.using_tex = self.TEX_COMMANDS[self._texcmd_cbox.get_active()] != "typst"
             self.set_default_preamble()
+            self.schedule_live_preview()
+
+        def cb_math_mode_changed(self, combo_box):
+            self.current_math_mode = mathmode.MATH_MODES[combo_box.get_active()]
+            self._gui_config["math_mode"] = self.current_math_mode
+            self.schedule_live_preview(delay_ms=0)
 
         def set_default_preamble(self):
             if self.using_tex:
@@ -865,31 +1032,135 @@ def load_asktext_gtk(use_gtk_source=None):
                 if res in (Gtk.ResponseType.CLOSE, Gtk.ResponseType.DELETE_EVENT):
                     return True
 
+            self.cancel_live_preview()
             Gtk.main_quit()
             return False
 
         def update_preview(self, widget):
-            """Update the preview image of the GUI using the callback it gave """
-            if self._preview_callback:
-                text = self._source_buffer.get_text(self._source_buffer.get_start_iter(),
-                                                    self._source_buffer.get_end_iter(), True)
+            """Preview button / CTRL+P: render now in the background; errors open the full dialog"""
+            self.schedule_live_preview(delay_ms=0, force=True, error_dialog=True)
 
-                if isinstance(self._preamble_widget, Gtk.FileChooser):
-                    preamble = self._preamble_widget.get_filename()
-                    if not preamble:
-                        preamble = ""
-                else:
-                    preamble = self._preamble_widget.get_text()
+        # ---------- textext-improved: live preview
+        def buffer_text(self):
+            if self._source_buffer is None:
+                return ""
+            return self._source_buffer.get_text(self._source_buffer.get_start_iter(),
+                                                self._source_buffer.get_end_iter(), True)
 
-                try:
-                    self._preview_callback(text, preamble, self.set_preview_image_from_file,
-                                           self.TEX_COMMANDS[self._texcmd_cbox.get_active()].lower(),
-                                           self._gui_config.get("white_preview_background", self.DEFAULT_PREVIEW_WHITE_BACKGROUND))
-                except Exception as error:
-                    self.show_error_dialog("TexText Error",
-                                           "Error occurred while generating preview:",
-                                            error)
-                    return False
+        def current_preamble_file(self):
+            if isinstance(self._preamble_widget, Gtk.FileChooser):
+                preamble = self._preamble_widget.get_filename() or ""
+            else:
+                preamble = self._preamble_widget.get_text()
+            return os.path.abspath(preamble) if preamble else ""
+
+        def preamble_text(self):
+            path = self.current_preamble_file()
+            try:
+                if path and os.path.isfile(path):
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        return f.read()
+            except OSError:
+                pass
+            return ""
+
+        def schedule_live_preview(self, widget=None, delay_ms=None, force=False, error_dialog=False):
+            """(Re)start the typing-pause timer; when it fires, render the preview in the background"""
+            if self._preview_callback is None or self._source_buffer is None:
+                return
+            if not force and not self._gui_config.get("live_preview", self.DEFAULT_LIVE_PREVIEW):
+                return
+            if self._live_timer is not None:
+                GLib.source_remove(self._live_timer)
+                self._live_timer = None
+            if error_dialog:
+                self._live_pending_dialog = True
+            delay = self.LIVE_PREVIEW_DELAY_MS if delay_ms is None else delay_ms
+            self._live_timer = GLib.timeout_add(max(delay, 1), self._live_timer_fired)
+
+        def cancel_live_preview(self):
+            if self._live_timer is not None:
+                GLib.source_remove(self._live_timer)
+                self._live_timer = None
+            self._live_pending = False
+            self._live_generation += 1  # results of a render still running are discarded
+
+        def _live_timer_fired(self):
+            self._live_timer = None
+            if self._live_thread is not None:
+                self._live_pending = True  # one render at a time; rerun with the latest text when it ends
+            else:
+                self._start_live_render()
+            return False
+
+        def _start_live_render(self):
+            text = self.buffer_text()
+            show_dialog = self._live_pending_dialog
+            self._live_pending_dialog = False
+            if not text.strip():
+                self._set_preview_error(None)
+                self._preview_scroll_window.hide()
+                return
+            self._live_generation += 1
+            args = (self._live_generation, show_dialog, text, self.current_preamble_file(),
+                    self.TEX_COMMANDS[self._texcmd_cbox.get_active()].lower(),
+                    self._gui_config.get("white_preview_background", self.DEFAULT_PREVIEW_WHITE_BACKGROUND),
+                    self.current_math_mode)
+            self._live_thread = threading.Thread(target=self._live_render_worker, args=args, daemon=True)
+            self._live_thread.start()
+
+        def _live_render_worker(self, generation, show_dialog, text, preamble, tex_command, white_bg, math_mode):
+            """Runs in a worker thread: no GTK calls here, results go back via GLib.idle_add"""
+            captured = {}
+
+            def keep_png(path):
+                # the PNG lives in a temporary directory that is deleted when the render returns
+                with open(path, "rb") as f:
+                    captured["png"] = f.read()
+
+            try:
+                self._preview_callback(text, preamble, keep_png, tex_command, white_bg, math_mode=math_mode)
+                GLib.idle_add(self._live_render_done, generation, show_dialog, captured.get("png"), None)
+            except Exception as error:
+                GLib.idle_add(self._live_render_done, generation, show_dialog, None, error)
+
+        def _live_render_done(self, generation, show_dialog, png, error):
+            self._live_thread = None
+            if generation == self._live_generation:
+                if png:
+                    try:
+                        loader = GdkPixbuf.PixbufLoader()
+                        loader.write(png)
+                        loader.close()
+                        self._pixbuf = loader.get_pixbuf()
+                        self._preview_scroll_window.set_has_tooltip(False)
+                        self._set_preview_error(None)
+                        self.update_preview_representation()
+                    except Exception as load_error:
+                        self._set_preview_error(load_error)
+                elif error is not None:
+                    # keep the last good image; show the error beneath it
+                    self._set_preview_error(error)
+                    if show_dialog:
+                        self.show_error_dialog("TexText Error", "Error occurred while generating preview:", error)
+            if self._live_pending:
+                self._live_pending = False
+                self._start_live_render()
+            return False
+
+        def _set_preview_error(self, error):
+            if self._preview_error_label is None:
+                return
+            if error is None:
+                self._preview_error_label.hide()
+                return
+            lines = [line for line in str(error).strip().splitlines() if line.strip()]
+            message = "\n".join(lines[:3]) if lines else error.__class__.__name__
+            self._preview_error_label.set_markup(
+                "<span foreground='#c01c28'>{}</span>".format(GLib.markup_escape_text(message)))
+            self._preview_error_label.set_tooltip_text(
+                "Preview could not be rendered. Press Preview (CTRL+P) for the full error.")
+            self._preview_error_label.show()
 
         def set_preview_image_from_file(self, path):
             """
@@ -930,7 +1201,7 @@ def load_asktext_gtk(use_gtk_source=None):
 
                 pixbuf = self._pixbuf
                 if scale != 1:
-                    pixbuf = self._pixbuf.scale_simple(int(image_width * scale), int(image_height * scale),
+                    pixbuf = self._pixbuf.scale_simple(max(1, int(image_width * scale)), max(1, int(image_height * scale)),
                                                                                   GdkPixbuf.InterpType.BILINEAR)
                     self._preview_scroll_window.set_tooltip_text("Double click: scale to original size")
 
@@ -981,7 +1252,8 @@ def load_asktext_gtk(use_gtk_source=None):
             button_box.add(self._cancel_button)
 
             self._preview_button = Gtk.Button(label="Preview")
-            self._preview_button.set_tooltip_text("LaTeX only: Show/ update preview (CTRL+P)")
+            self._preview_button.set_tooltip_text("Show/ update preview now (CTRL+P). "
+                                                  "With View > Live Preview on, it also updates as you type.")
             button_box.add(self._preview_button)
 
             self._ok_button = Gtk.Button(stock=Gtk.STOCK_SAVE)
@@ -1073,6 +1345,20 @@ def load_asktext_gtk(use_gtk_source=None):
             self._texcmd_cbox.set_active(self.TEX_COMMANDS.index(self.current_texcmd))
             self._texcmd_cbox.set_tooltip_text("Command used for compiling.")
             texcmd_box.pack_start(self._texcmd_cbox, True, True, 5)
+
+            # --- textext-improved: math mode ---
+            self._math_mode_cbox = Gtk.ComboBoxText()
+            for label in ("Off", "Inline $…$", "Display"):
+                self._math_mode_cbox.append_text(label)
+            self._math_mode_cbox.set_active(mathmode.MATH_MODES.index(mathmode.normalize_mode(self.current_math_mode)))
+            self._math_mode_cbox.set_tooltip_text(
+                "Wrap the text in math mode when it has no $, \\( or \\[ of its own, so you don't have to "
+                "type them. Inline: $…$. Display: $\\displaystyle …$. Off: text is compiled as typed. "
+                "Saved with each node; new nodes use the last choice.")
+            self._math_mode_cbox.connect("changed", self.cb_math_mode_changed)
+            math_label = Gtk.Label(label="Math:")
+            texcmd_box.pack_start(math_label, False, False, 2)
+            texcmd_box.pack_start(self._math_mode_cbox, False, False, 5)
 
             # --- Scaling ---
             scale_frame = Gtk.Frame()
@@ -1172,6 +1458,23 @@ def load_asktext_gtk(use_gtk_source=None):
             scroll_window.add(self._source_view)
             set_monospace_font(self._source_view, self.DEFAULT_FONTSIZE)
 
+            # textext-improved: LaTeX auto-completion
+            if LatexCompletionProvider is not None:
+                try:
+                    completion = self._source_view.get_completion()
+                    self._completion_provider = LatexCompletionProvider(self)
+                    completion.add_provider(self._completion_provider)
+                    completion.set_property("show-headers", False)
+                    completion.set_property("show-icons", False)
+                    completion.set_property("remember-info-visibility", True)
+                    completion.set_property("auto-complete-delay", 150)
+                    completion.connect("show", lambda *_: setattr(self, "_completion_visible", True))
+                    completion.connect("hide", lambda *_: setattr(self, "_completion_visible", False))
+                    if not self._gui_config.get("autocomplete", self.DEFAULT_AUTOCOMPLETE):
+                        completion.block_interactive()
+                except Exception:
+                    self._completion_provider = None
+
             # Action group and UI manager
             ui_manager = Gtk.UIManager()
             accel_group = ui_manager.get_accel_group()
@@ -1187,6 +1490,9 @@ def load_asktext_gtk(use_gtk_source=None):
             action_group.add_toggle_actions(self._confirm_close_action, source_view)
             action_group.add_toggle_actions(self._word_wrap_action, source_view)
             action_group.add_toggle_actions(self._preview_white_background_action, source_view)
+            action_group.add_toggle_actions(self._live_preview_action, source_view)
+            if GtkSource is not None:
+                action_group.add_toggle_actions(self._autocomplete_action, source_view)
             if GtkSource is not None:
                 action_group.add_toggle_actions(self._toggle_actions, source_view)
                 action_group.add_radio_actions(self._radio_actions, -1, self.tabs_toggled_cb, source_view)
@@ -1215,6 +1521,12 @@ def load_asktext_gtk(use_gtk_source=None):
             preview_event_box.connect('button-press-event', self.switch_preview_representation)
             preview_event_box.add(self._preview_scroll_window)
 
+            # textext-improved: one-line error under the live preview
+            self._preview_error_label = Gtk.Label()
+            self._preview_error_label.set_line_wrap(True)
+            self._preview_error_label.set_xalign(0.0)
+            self._preview_error_label.set_selectable(True)
+
             # Vertical Layout
             vbox = Gtk.VBox(False, 4)
             window.add(vbox)
@@ -1232,6 +1544,7 @@ def load_asktext_gtk(use_gtk_source=None):
             vbox.pack_start(scroll_window, True, True, 0)
             vbox.pack_start(self.pos_label, False, False, 0)
             vbox.pack_start(preview_event_box, False, False, 0)
+            vbox.pack_start(self._preview_error_label, False, False, 2)
             buttons_row = self.create_buttons()
             vbox.pack_start(buttons_row, False, False, 0)
 
@@ -1245,6 +1558,7 @@ def load_asktext_gtk(use_gtk_source=None):
             ]
 
             self._preview_scroll_window.hide()
+            self._preview_error_label.hide()
 
             # preselect menu check items
             groups = ui_manager.get_action_groups()
@@ -1265,6 +1579,11 @@ def load_asktext_gtk(use_gtk_source=None):
             action.set_active(self._gui_config.get("confirm_close", self.DEFAULT_CONFIRM_CLOSE))
             action = action_group.get_action('WhitePreviewBackground')
             action.set_active(self._gui_config.get("white_preview_background", self.DEFAULT_PREVIEW_WHITE_BACKGROUND))
+            action = action_group.get_action('LivePreview')
+            action.set_active(self._gui_config.get("live_preview", self.DEFAULT_LIVE_PREVIEW))
+            if GtkSource is not None:
+                action = action_group.get_action('AutoComplete')
+                action.set_active(self._gui_config.get("autocomplete", self.DEFAULT_AUTOCOMPLETE))
             if GtkSource is not None:
                 action = action_group.get_action('ShowNumbers')
                 action.set_active(self._gui_config.get("line_numbers", self.DEFAULT_SHOWLINENUMBERS))
@@ -1296,6 +1615,11 @@ def load_asktext_gtk(use_gtk_source=None):
             text_buffer.connect('changed', self.update_position_label, self, source_view)
             window.connect('delete-event', self.window_deleted_cb, source_view)
             text_buffer.connect('mark_set', self.move_cursor_cb, source_view)
+            text_buffer.connect('changed', self.schedule_live_preview)
+            if isinstance(self._preamble_widget, Gtk.FileChooser):
+                self._preamble_widget.connect('file-set', self.schedule_live_preview)
+            else:
+                self._preamble_widget.connect('changed', self.schedule_live_preview)
 
             icon_sizes = [16, 32, 64, 128]
             icon_files = [os.path.join(
@@ -1325,9 +1649,29 @@ def load_asktext_gtk(use_gtk_source=None):
                 self._window = window
                 self._window.set_focus(self._source_view)
 
-                # main loop
-                Gtk.main()
+                # textext-improved: bring the dialog to the front (macOS opens it behind Inkscape),
+                # and render the preview of an existing node straight away
+                GLib.idle_add(self._bring_to_front)
+                GLib.timeout_add(300, self._bring_to_front)
+                if self.buffer_text().strip():
+                    self.schedule_live_preview(delay_ms=50)
+
+                # main loop. textext-improved: C-level GTK/GLib warnings printed while the dialog runs
+                # (more likely now that the preview renders in the background) would otherwise reach
+                # stderr, which Inkscape shows as an "additional data from the script" popup.
+                with SuppressStream():
+                    Gtk.main()
                 return self._gui_config
+
+        def _bring_to_front(self):
+            try:
+                macos_front.activate_current_process()
+                self._window.set_keep_above(True)
+                self._window.present()
+                self._window.set_keep_above(False)
+            except Exception:
+                pass
+            return False
 
         def show_error_dialog(self, title, message_text, exception):
 

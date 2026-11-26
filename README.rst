@@ -1,3 +1,18 @@
+textext-improved
+================
+
+A fork of `TexText <https://github.com/textext/textext>`__ 1.13.0 with these changes to the GTK dialog:
+
+- **Comes to the front** when it opens on macOS, instead of opening behind Inkscape.
+- **Live preview**: renders in the background a moment after you stop typing (View > Live Preview). A LaTeX error appears in red under the last good preview; the Preview button (CTRL+P) shows the full error.
+- **Auto-complete**: LaTeX commands after a backslash (``\fr`` -> ``\frac{}{}``), environments inside ``\begin{`` (with the matching ``\end``), plus commands defined in your preamble or already used in the text (View > Auto-complete LaTeX).
+- **No need to type $**: a *Math* selector (Off / Inline / Display) wraps the text in ``$...$`` or ``$\displaystyle ...$`` at compile time when it has no math delimiters of its own. The text is stored as you typed it, and each node remembers its mode; nodes made with stock TexText are treated as *Off*.
+- **Word wrap** is on by default.
+
+Upstream documentation follows.
+
+----
+
 |status-ci| |status-downloads|
 
 TexText - A TeX / typst extension for Inkscape
