@@ -347,6 +347,11 @@ def load_asktext_tk():
             window_height = self._root.winfo_height()
             window_xpos = (screen_width/2) - (window_width/2)
             window_ypos = (screen_height/2) - (window_height/2)
+            # textext-improved: centre on Inkscape's window instead (Tk uses the main display's origin)
+            target = macos_front.find_window_bounds(pids=(os.getppid(),))
+            if target is not None:
+                window_xpos, window_ypos = macos_front.centered_position(
+                    target["cg"], (window_width, window_height), target["cg"])
             self._root.geometry('%dx%d+%d+%d' % (window_width, window_height, window_xpos, window_ypos))
 
             # Update status
@@ -1643,6 +1648,8 @@ def load_asktext_gtk(use_gtk_source=None):
                 with SuppressStream():  # suppress GTK Warings printed directly to stderr in C++
                     window = self.create_window()
                 window.set_default_size(500, 525)
+                # textext-improved: open centred on Inkscape's window (and so on its monitor)
+                self._place_over_inkscape(window)
                 # Until commit 802d295e46877fd58842b61dbea4276372a2505d we called own normalize_ui_row_heights here with
                 # bad hide/show/hide hack, see issue #114
                 window.show()
@@ -1662,6 +1669,24 @@ def load_asktext_gtk(use_gtk_source=None):
                 with SuppressStream():
                     Gtk.main()
                 return self._gui_config
+
+        @staticmethod
+        def _place_over_inkscape(window):
+            try:
+                target = macos_front.find_window_bounds(pids=(os.getppid(),))
+                if target is None:
+                    return
+                x, y, w, h = target["gdk"]
+                monitor = Gdk.Display.get_default().get_monitor_at_point(int(x + w / 2), int(y + h / 2))
+                area = monitor.get_workarea()
+                default_w, default_h = window.get_default_size()
+                natural = window.get_preferred_size()[1]
+                size = (max(default_w, natural.width), max(default_h, natural.height))
+                window.set_position(Gtk.WindowPosition.NONE)
+                window.move(*macos_front.centered_position(target["gdk"], size,
+                                                           (area.x, area.y, area.width, area.height)))
+            except Exception:
+                pass
 
         def _bring_to_front(self):
             try:
